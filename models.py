@@ -8,17 +8,17 @@ class VAE(nn.Module):
         
         self.a=F.leaky_relu
         # encoder
-        self.l_enc_h_1 = nn.Linear(784, 512)
-        self.l_enc_h_2 = nn.Linear(512, 512)
-        self.l_enc_mu = nn.Linear(512, 64)
-        self.l_enc_var = nn.Linear(512, 64)
+        self.l_enc_h_1 = nn.Linear(784, 256)
+        self.l_enc_h_2 = nn.Linear(256, 128)
+        self.l_enc_mu = nn.Linear(128, 8)
+        self.l_enc_var = nn.Linear(128, 8)
 
         # decoder
-        self.l_dec_h_1 = nn.Linear(64, 512)
-        self.l_dec_h_2 = nn.Linear(512, 512)
+        self.l_dec_h_1 = nn.Linear(8, 128)
+        self.l_dec_h_2 = nn.Linear(128, 256)
 
         # output
-        self.out = nn.Linear(512, 784)
+        self.out = nn.Linear(256, 784)
 
     def reparameterize(self, mu, logvar):
         """
@@ -65,7 +65,7 @@ class VAE(nn.Module):
         mu=args[2][0]
         log_var=args[3][0]
 
-        kld_weight=kwargs['M_N']
+        kld_weight=kwargs['temp']
         recons_loss=F.mse_loss(recons, input)
 
         kld_loss=torch.mean(-0.5 * torch.sum(1 + log_var - mu**2 - log_var.exp(), dim=1), dim=0)

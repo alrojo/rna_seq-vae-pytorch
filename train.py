@@ -23,8 +23,8 @@ parser.add_argument("-batch_size", type=int,
         help="batch_size train", default=256)
 parser.add_argument("-batch_size_test", type=int,
         help="batch_size test", default=25)
-parser.add_argument("-latent_sizes", type=str,
-        help="latent_sizes", default="64,32")
+parser.add_argument("-temp", type=float,
+        help="temp", default=1.0)
 parser.add_argument("-hidden_sizes", type=str,
         help="hidden_sizes", default="512,256")
 parser.add_argument("-verbose", type=str,
@@ -45,6 +45,13 @@ args=parser.parse_args()
 def verbose_print(text):
     if verbose: print(text)
 
+def temp_scheduler(epoch):
+    if epoch < 100:
+        return 0.0
+    elif epoch < 200:
+        return (epoch-100)*0.0001
+    else:
+        return 1.0
 
 def plotsamples(name,outfolder,samples):
     shp=samples.shape[1:]
@@ -92,9 +99,7 @@ with open(logfile, 'w') as f:
 
 # set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 bernoullisample=lambda x: np.random.binomial(1,x,size=x.shape).astype(np.float32)
-
 
 transform=transforms.Compose([
     transforms.ToTensor(),
@@ -133,8 +138,9 @@ else:
 net.to(device)
 print(net)
 optimizer=torch.optim.Adam(net.parameters(), lr=args.lr)
+scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.75)
 
-def train_epoch(net, dataloader, lr, epoch):
+def train_epoch(net, dataloader):
     net.train()
     running_loss={'loss': 0.0, 'KLD': 0.0, 'Reconstruction_Loss': 0.0}
     for i, data in tqdm(enumerate(dataloader), total=int(len(dataloader.dataset)/dataloader.batch_size)):
@@ -143,7 +149,7 @@ def train_epoch(net, dataloader, lr, epoch):
         optimizer.zero_grad()
         output=net(data)
         loss=net.loss_function(output['out'], output['x'], output['enc_mus'],
-                               output['enc_log_vars'], M_N=0.001)
+                               output['enc_log_vars'], temp=temp_scheduler(epoch))
         running_loss['loss']+=loss['loss'].item()
         running_loss['KLD']+=loss['KLD'].item()
         running_loss['Reconstruction_Loss']+=loss['Reconstruction_Loss'].item()
@@ -161,7 +167,7 @@ def validation_epoch(net, dataloader):
             data=data.view(data.size(0), -1).to(device)
             output=net(data)
             loss=net.loss_function(output['out'], output['x'], output['enc_mus'],
-                                   output['enc_log_vars'], M_N=0.0)
+                                   output['enc_log_vars'], temp=1.0)
             running_loss['loss']+=loss['loss'].item()
             running_loss['KLD']+=loss['KLD'].item()
             running_loss['Reconstruction_Loss']+=loss['Reconstruction_Loss'].item()
@@ -176,10 +182,11 @@ with open(trainlogfile,'a') as f:
     f.write(line + "\n")
 for epoch in range(1, args.num_epochs+1):
     start=time.time()
-    train_loss=train_epoch(net, train_loader, args.lr, epoch)
+    train_loss=train_epoch(net, train_loader)
+    scheduler.step()
     t = time.time() - start
     val_loss=validation_epoch(net, val_loader)
-    line = "*Epoch=%i\tTime=%0.2f\tLR=%0.5f\t" %(epoch, t, args.lr) + \
+    line = "*Epoch=%i\tTime=%0.2f\tLR=%0.5f\tTemp=%0.5f\t" %(epoch, t, optimizer.param_groups[0]['lr'], temp_scheduler(epoch)) + \
            "TRAIN:\tCost=%0.5f\tKLD=%0.5f\tRecon=%0.5f\t"%(train_loss['loss'], train_loss['KLD'], train_loss['Reconstruction_Loss']) + \
            "VAL:\tCost=%0.5f\tKLD=%0.5f\tRecon=%0.5f\t"%(val_loss['loss'], val_loss['KLD'], val_loss['Reconstruction_Loss'])
     print(line)
