@@ -1,174 +1,149 @@
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
+from torch.distributions import *
 
-class VAE(nn.Module):
-    def __init__(self):
-        super(VAE, self).__init__()
-        
-        self.a=F.leaky_relu
-        # encoder
-        self.l_enc_h_1 = nn.Linear(784, 256)
-        self.l_enc_h_2 = nn.Linear(256, 128)
-        self.l_enc_mu = nn.Linear(128, 8)
-        self.l_enc_var = nn.Linear(128, 8)
+class VAEsimple(nn.Module):
+    def __init__(self, input_dim=None, split_dim=None, nhiddens=[200,200], nlatent=20,
+                 beta=1.0, dropout=0.2, n_samples=3, cuda=False):
 
-        # decoder
-        self.l_dec_h_1 = nn.Linear(8, 128)
-        self.l_dec_h_2 = nn.Linear(128, 256)
+        if nlatent < 1:
+            raise ValueError('Minimum 1 latent neuron, not {}'.format(latent))
 
-        # output
-        self.out = nn.Linear(256, 784)
+        if not (0 <= dropout < 1):
+            raise ValueError('dropout must be 0 <= dropout < 1')
+        self.split_dim = split_dim
+        self.input_size = input_dim
 
-    def reparameterize(self, mu, logvar):
-        """
-        Reparameterization trick to sample from N(mu, var) from
-        N(0,1).
-        :param mu: (Tensor) Mean of the latent Gaussian [B x D]
-        :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
-        :return: (Tensor) [B x D]
-        """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return eps * std + mu
+        super(VAEsimple, self).__init__()
 
-    def encode(self, x):
-        x=self.a(self.l_enc_h_1(x)) 
-        x=self.a(self.l_enc_h_2(x)) 
-        mu=self.l_enc_mu(x)
-        log_var=self.l_enc_var(x)
-        z=self.reparameterize(mu, log_var)
+        # Initialize simple attributes
+        self.usecuda = cuda
+        self.beta = beta
+        self.nhiddens = nhiddens
+        self.nlatent = nlatent
+        self.dropout = dropout
+        self.n_samples = n_samples
 
-        return [z], [mu], [log_var]
+        self.device = torch.device("cuda" if self.usecuda == True else "cpu")
 
-    def decode(self, x):
-        x=self.a(self.l_dec_h_1(x)) 
-        x=self.a(self.l_dec_h_2(x)) 
+        # Activation functions
+        self.relu = nn.LeakyReLU()
+        self.sigmoid = nn.Sigmoid()
+        self.softplus = nn.Softplus()
+        self.dropoutinput = nn.Dropout(p=self.dropout*0.5)
 
-        # output
-        out=self.out(x)
-        return out, [], [], []
+        # Initialize lists for holding hidden layers
+        self.encoderlayers = nn.ModuleList()
+        self.encodernorms = nn.ModuleList()
+        self.encoderdrops = nn.ModuleList()
+        self.decoderlayers = nn.ModuleList()
+        self.decodernorms = nn.ModuleList()
+        self.decoderdrops = nn.ModuleList()
 
-    def forward(self, x):
-        enc_zs, enc_mus, enc_log_vars=self.encode(x) 
-        out, dec_zs, dec_mus, dec_log_vars=self.decode(enc_zs[-1]) 
-        formatted = {'out': out, 'x': x, 'enc_mus': enc_mus,
-                     'enc_log_vars': enc_log_vars, 'dec_mus': dec_mus,
-                     'dec_log_vars': dec_log_vars, 'enc_zs': enc_zs,
-                     'dec_zs': dec_zs}
+        ### Layers
+        # Hidden layers
+        for nin, nout in zip([self.input_size] + self.nhiddens, self.nhiddens):
+            self.encoderlayers.append(nn.Linear(nin, nout))
+            self.encoderdrops.append(nn.Dropout(p=self.dropout))
+            #self.encodernorms.append(nn.BatchNorm1d(nout))
 
-        return formatted
+        # Latent layers
+        self.mu = nn.Linear(self.nhiddens[-1], self.nlatent) # mu layer
+        self.var = nn.Linear(self.nhiddens[-1], self.nlatent) # logvariance layer
 
-    def loss_function(self, *args, **kwargs):
-        recons=args[0]
-        input=args[1]
-        mu=args[2][0]
-        log_var=args[3][0]
+        # Decoding layers
+        for nin, nout in zip([self.nlatent] + self.nhiddens[::-1], self.nhiddens[::-1]):
+            self.decoderlayers.append(nn.Linear(nin, nout))
+            #self.decodernorms.append(nn.BatchNorm1d(nout))
+            self.decoderdrops.append(nn.Dropout(p=self.dropout))
 
-        kld_weight=kwargs['temp']
-        recons_loss=F.mse_loss(recons, input)
+        # Reconstruction - output layers
+        self.out = nn.Linear(self.nhiddens[0], self.input_size) #to output
 
-        kld_loss=torch.mean(-0.5 * torch.sum(1 + log_var - mu**2 - log_var.exp(), dim=1), dim=0)
-        kld_re=kld_weight*kld_loss
-        #print(kld_re)
+    def encode(self, tensor):
+        tensors = list()
+        # hidden layers
+        for encoderlayer, encoderdrop in zip(self.encoderlayers, self.encoderdrops):
+            tensor = encoderdrop(self.relu(encoderlayer(tensor)))
+            tensors.append(tensor)
 
-        loss=recons_loss+kld_re
-        return {'loss': loss, 'Reconstruction_Loss': recons_loss, 'KLD':-kld_loss}
+        return self.mu(tensor), self.softplus(self.var(tensor))
 
-    def sample(self, num_samples, current_device):
-        z=torch.randn(num_samples. self.latent_dim)
-        z=z.to(current_device)
-        samples=self.decode(z)
-        return samples
+    def reparametize(self, mu, std, n_samples):
+        q_z = Independent(Normal(mu, std), 1)
 
+        return q_z, q_z.rsample(torch.Size([n_samples]))
 
-class hVAE(nn.Module):
-    def __init__(self):
-        super(VAE, self).__init__()
-        
-        self.a=F.leaky_relu
-        # encoder
-        self.l_enc_h_11 = nn.Linear(784, 512)
-        self.l_enc_h_12 = nn.Linear(512, 512)
-        self.l_enc_mu_1 = nn.Linear(512, 64)
-        self.l_enc_var_1 = nn.Linear(512, 64)
+    def decode(self, tensor, n_samples):
+        tensors = list()
 
-        self.l_enc_h_21 = nn.Linear(64, 256)
-        self.l_enc_h_22 = nn.Linear(256, 256)
-        self.l_enc_mu_2 = nn.Linear(256, 32)
-        self.l_enc_var_2 = nn.Linear(256, 32)
-        
-        # decoder
-        self.l_dec_h_21 = nn.Linear(32, 256)
-        self.l_dec_h_22 = nn.Linear(256, 256)
+        for decoderlayer, decoderdrop in zip(self.decoderlayers, self.decoderdrops):
+            tensor = decoderdrop(self.relu(decoderlayer(tensor)))
+            tensors.append(tensor)
 
-        self.l_dec_mu_1 = nn.Linear(256, 64)
-        self.l_dec_var_1 = nn.Linear(256, 64)
-        self.l_dec_h_11 = nn.Linear(64, 512)
-        self.l_dec_h_12 = nn.Linear(512, 512)
+        reconstruction = self.out(tensor)
 
-        # output
-        self.out = nn.Linear(512, 784)
+        return reconstruction
 
-    def reparameterize(self, mu, logvar):
-        """
-        Reparameterization trick to sample from N(mu, var) from
-        N(0,1).
-        :param mu: (Tensor) Mean of the latent Gaussian [B x D]
-        :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
-        :return: (Tensor) [B x D]
-        """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return eps * std + mu
+    def forward(self, tensor, n_samples):
+        mu, std = self.encode(tensor)
+        q_z, z = self.reparametize(mu, std, n_samples)
+        out = self.decode(z, n_samples)
 
-    def encode(self, x):
-        # layer enc 1
-        x=self.a(self.l_enc_h_11(x)) 
-        x=self.a(self.l_enc_h_12(x)) 
-        mu1=self.l_enc_mu_1(x)
-        logvar1=self.l_enc_var_1(x)
-        z1=self.reparameterize(mu1, logvar1)
+        return out, q_z, z
 
-        # layer enc 2
-        x=self.a(self.l_enc_h_21(z1)) 
-        x=self.a(self.l_enc_h_22(x)) 
-        mu2=self.l_enc_mu_2(x)
-        logvar2=self.l_enc_var_2(x)
-        z2=self.reparameterize(mu2, logvar2)
-        return [z1, z2], [mu1, mu2], [logvar1, logvar2]
+    # Reconstruction loss + KL Divergence losses summed over all elements and batch
+    def loss_function(self, input_data, output, mask, q_z, p_z, kld_w):
+        # Repeat data by n_samples
+        n_samples = output.shape[0]
+        input_data = input_data.repeat(n_samples,1,1)
+        mask = mask.repeat(n_samples,1,1)
 
-    def decode(self, x):
-        # layer dec 2
-        x=self.a(self.l_dec_h_21(x)) 
-        x=self.a(self.l_dec_h_22(x)) 
+        mse_loss = nn.MSELoss(reduction='none')
+        rec_loss = (mse_loss(output, input_data)*mask).sum()/mask.sum()
 
-        # layer dec 1
-        mu1=self.l_dec_mu_1(x)
-        logvar1=self.l_dec_var_1(x)
-        z1=self.reparameterize(mu1, logvar1)
-        x=self.a(self.l_dec_h_11(z1)) 
-        x=self.a(self.l_dec_h_12(x)) 
+        # KLD calculation and weight
+        KLD = (kl_divergence(q_z, p_z)/self.nlatent).mean()
+        KLD_weight = self.beta * kld_w
 
-        # output
-        out=self.out(x)
-        return out, [z1], [mu1], [logvar1]
+        # Final loss
+        loss = rec_loss + KLD * KLD_weight
 
-    def forward(self, x):
-        enc_zs, enc_mus, enc_log_vars=self.encode(x) 
-        out, dec_zs, dec_mus, dec_log_vars=self.decode(enc_zs[-1]) 
+        return loss, rec_loss, KLD
 
-        return [out, enc_mus, enc_log_vars, dec_mus, dec_log_vars]
+    def training_func(self, train_loader, epoch, optimizer, p_z, kld_w, n_samples):
 
-if __name__ == "__main__":
-    net=VAE()
-    import numpy as np
-    sample=np.random.normal(0,1,(10,784))
-    sample=np.float32(sample)
-    out=net(torch.from_numpy(sample))
-    for ou in out:
-        if isinstance(ou, list):
-            for o in ou:
-                print(o.shape)
-        else:
-            print(ou.shape)
+        self.train()
+        train_loss = 0
+        log_interval = 50
+
+        epoch_loss = 0
+        epoch_kldloss = 0
+        epoch_recloss = 0
+
+        for batch_idx, (data, mask) in enumerate(train_loader):
+            data = data.to(self.device).float()
+            mask = mask.to(self.device).float()
+
+            optimizer.zero_grad()
+
+            out, q_z, _ = self(data, n_samples)
+
+            loss, rec_loss, kld = self.loss_function(data, out, mask, q_z, p_z, kld_w)
+            loss.backward()
+
+            epoch_loss += loss.data.item()
+            epoch_kldloss += kld.data.item()
+            epoch_recloss += rec_loss.data.item()
+
+            optimizer.step()
+
+        print('\tEpoch: {}\tLoss: {:.6f}\tRec: {:.6f}\tKLD: {:.4f}\tBatchsize: {}'.format(
+            epoch,
+            epoch_loss / len(train_loader),
+            epoch_recloss / len(train_loader),
+            epoch_kldloss / len(train_loader),
+            train_loader.batch_size,
+            ))
+        return epoch_loss / len(train_loader), epoch_recloss / len(train_loader), epoch_kldloss / len(train_loader)

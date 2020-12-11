@@ -1,194 +1,60 @@
-# -*- coding: utf-8 -*-
-import os, shutil, argparse, operator, time
-import torch
 import numpy as np
-import matplotlib.pyplot as plt
+import torch
+from torch import optim
+from torch.distributions import *
 import torchvision.transforms as transforms
 from torchvision import datasets
-from tqdm import tqdm
-from torch.utils.data import DataLoader
+from models import VAEsimple
+from data import make_dataloader 
+from dataloader import load_data
 
-# local repos
-#import data
-import models
-
-# Inspirations from https://github.com/casperkaae/LVAE
-# Original paper: https://arxiv.org/abs/1602.02282
-parser=argparse.ArgumentParser()
-parser.add_argument("-lr", type=float,
-        help="lr", default=0.002)
-parser.add_argument("-outfolder", type=str,
-        help="outfolder", default="dump")
-parser.add_argument("-batch_size", type=int,
-        help="batch_size train", default=256)
-parser.add_argument("-batch_size_test", type=int,
-        help="batch_size test", default=25)
-parser.add_argument("-temp", type=float,
-        help="temp", default=1.0)
-parser.add_argument("-hidden_sizes", type=str,
-        help="hidden_sizes", default="512,256")
-parser.add_argument("-verbose", type=str,
-        help="verbose printing", default="False")
-parser.add_argument("-num_epochs", type=int,
-        help="num_epochs", default=5000)
-parser.add_argument("-eval_epochs", type=str,
-        help="eval_epochs", default="1,10,100")
-parser.add_argument("-dataset", type=str,
-        help="mnistresample", default="mnistresample")
-parser.add_argument("-modeltype", type=str,
-        help="AE|VAE", default="VAE")
-parser.add_argument("-L2", type=float,
-        help="L2", default=0.0)
-args=parser.parse_args()
-
-# functions
-def verbose_print(text):
-    if verbose: print(text)
-
-def temp_scheduler(epoch):
-    if epoch < 100:
-        return 0.0
-    elif epoch < 200:
-        return (epoch-100)*0.0001
-    else:
-        return 1.0
-
-def plotsamples(name,outfolder,samples):
-    shp=samples.shape[1:]
-    nsamples=samples.shape[0]
-
-    samples_pr_size=int(np.sqrt(nsamples))
-    if len(shp)==3:
-        canvas = np.zeros((h*samples_pr_size, samples_pr_size*w,shp[2]))
-        cm = None
-    else:
-        canvas = np.zeros((h*samples_pr_size, samples_pr_size*w))
-        cm = plt.gray()
-    idx=0
-    for i in range(samples_pr_size):
-        for j in range(samples_pr_size):
-            canvas[i*h:(i+1)*h, j*w:(j+1)*w] = np.clip(samples[idx],1e-6,1-1e-6)
-            idx += 1
-    plt.figure(figsize=(7, 7))
-    plt.imshow(canvas,cmap=cm)
-    plt.savefig(outfolder+'/' + name +'.png')
-
-#setup output
-if not os.path.exists(args.outfolder):
-    os.makedirs(args.outfolder)
-
-#logfile
-args_dict=vars(args)
-sorted_args=sorted(args_dict.items(), key=operator.itemgetter(0))
-description=[]
-description.append('################################')
-description.append('# --Commandline Params-- #')
-for name, val in sorted_args:
-    description.append("# " + name + ":\t" + str(val))
-description.append('################################')
-
-scriptpath=os.path.realpath(__file__)
-filename=os.path.basename(scriptpath)
-#shutil.copy(scriptpath, args.outfolder + '/' + filename)
-logfile=args.outfolder+'/logfile.log'
-trainlogfile=args.outfolder+'/trainlogfile.log'
-model_out=args.outfolder+'/model'
-with open(logfile, 'w') as f:
-    for l in description:
-        f.write(l + '\n')
-
-# set device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 bernoullisample=lambda x: np.random.binomial(1,x,size=x.shape).astype(np.float32)
 
-transform=transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Lambda(bernoullisample)
-    ])
-# get dataset
-train_data = datasets.MNIST(
-    root='data',
-    train=True,
-    download=True,
-    transform=transform
-)
-val_data = datasets.MNIST(
-    root='data',
-    train=False,
-    download=True,
-    transform=transform
-)
-train_loader=DataLoader(
-    train_data,
-    batch_size=args.batch_size,
-    shuffle=True
-)
-val_loader=DataLoader(
-    train_data,
-    batch_size=args.batch_size,
-    shuffle=False
-)
-outputnonlin=torch.sigmoid
+class VAE(object):
+    def __init__(self, input_dim, n_latent=16, lrate=1e-3, nhiddens=[256,128]):
+        # model setup
+        self.input_dim = input_dim
+        self.n_latent = n_latent
+        self.lrate = lrate
+        self.cuda = torch.cuda.is_available()
+        self.nhiddens=nhiddens
+        self.model = VAEsimple(input_dim=self.input_dim, split_dim=7,
+                         nhiddens=self.nhiddens, nlatent=self.n_latent,
+                         beta=1.0, dropout=0.1, cuda=self.cuda)
+        self.z0_prior = Independent(Normal(torch.zeros(self.n_latent),
+                                    torch.ones(self.n_latent)), 1)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lrate)
 
-# model
-if args.modeltype=='VAE':
-    net=models.VAE()
-else:
-    raise ValueError()
-net.to(device)
-print(net)
-optimizer=torch.optim.Adam(net.parameters(), lr=args.lr)
-scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.75)
+    def fit(self, data_train, data_test=None, mask_train=None, mask_test=None,
+            batch_size_train=16, batch_size_test=16, nepochs=500, n_samples=3,
+            wait_until_kl_inc=25):
+        # model parameters
+        if data_test is None:
+            data_test = data_train
+        if mask_train is None:
+            mask_train = np.ones_like(data_train)
+        if mask_test is None:
+            mask_test = np.ones_like(data_test)
+        # get dataset
+        trainloader = make_dataloader(data_train, mask_train,
+                                      batchsize=batch_size_train, shuffle=True)
+        testloader = make_dataloader(data_test, mask_test,
+                                     batchsize=batch_size_test, shuffle=False)
+        # training
+        for epoch in range(1, nepochs + 1):
+            #lr = lrate * (0.8 ** (epoch // 50))
+            if epoch // 1 < wait_until_kl_inc:
+                kl_coef = 0.
+            else:
+                kl_coef = (1-0.96** (epoch // 1 - wait_until_kl_inc))
+            loss, recloss, kld = self.model.training_func(trainloader, epoch,
+                                                     self.optimizer, self.z0_prior,
+                                                     kl_coef, n_samples)
+    def transform(self, data, n_samples=3):
+        emb = self.model.encode(torch.from_numpy(data))
+        #return emb[2].mean(0).detach().numpy() # take the z and mean across n_samples
+        return emb[0].detach().numpy() # take the z and mean across n_samples
 
-def train_epoch(net, dataloader):
-    net.train()
-    running_loss={'loss': 0.0, 'KLD': 0.0, 'Reconstruction_Loss': 0.0}
-    for i, data in tqdm(enumerate(dataloader), total=int(len(dataloader.dataset)/dataloader.batch_size)):
-        data, _ = data
-        data=data.view(data.size(0), -1).to(device)
-        optimizer.zero_grad()
-        output=net(data)
-        loss=net.loss_function(output['out'], output['x'], output['enc_mus'],
-                               output['enc_log_vars'], temp=temp_scheduler(epoch))
-        running_loss['loss']+=loss['loss'].item()
-        running_loss['KLD']+=loss['KLD'].item()
-        running_loss['Reconstruction_Loss']+=loss['Reconstruction_Loss'].item()
-        loss['loss'].backward()
-        optimizer.step()
-    train_loss = {key:value/len(dataloader.dataset) for key, value in running_loss.items()}
-    return train_loss
-
-def validation_epoch(net, dataloader):
-    net.eval()
-    running_loss={'loss': 0.0, 'KLD': 0.0, 'Reconstruction_Loss': 0.0}
-    with torch.no_grad():
-        for i, data in tqdm(enumerate(dataloader), total=int(len(val_data)/dataloader.batch_size)):
-            data, _ = data
-            data=data.view(data.size(0), -1).to(device)
-            output=net(data)
-            loss=net.loss_function(output['out'], output['x'], output['enc_mus'],
-                                   output['enc_log_vars'], temp=1.0)
-            running_loss['loss']+=loss['loss'].item()
-            running_loss['KLD']+=loss['KLD'].item()
-            running_loss['Reconstruction_Loss']+=loss['Reconstruction_Loss'].item()
-    val_loss = {key:value/len(dataloader.dataset) for key, value in running_loss.items()}
-    return val_loss
-
-val_loss=validation_epoch(net, val_loader)
-line = "*Epoch=0\t" + \
-       "VAL:\tCost=%0.5f\tKLD=%0.5f\tRecon=%0.5f\t"%(val_loss['loss'], val_loss['KLD'], val_loss['Reconstruction_Loss'])
-print(line)
-with open(trainlogfile,'a') as f:
-    f.write(line + "\n")
-for epoch in range(1, args.num_epochs+1):
-    start=time.time()
-    train_loss=train_epoch(net, train_loader)
-    scheduler.step()
-    t = time.time() - start
-    val_loss=validation_epoch(net, val_loader)
-    line = "*Epoch=%i\tTime=%0.2f\tLR=%0.5f\tTemp=%0.5f\t" %(epoch, t, optimizer.param_groups[0]['lr'], temp_scheduler(epoch)) + \
-           "TRAIN:\tCost=%0.5f\tKLD=%0.5f\tRecon=%0.5f\t"%(train_loss['loss'], train_loss['KLD'], train_loss['Reconstruction_Loss']) + \
-           "VAL:\tCost=%0.5f\tKLD=%0.5f\tRecon=%0.5f\t"%(val_loss['loss'], val_loss['KLD'], val_loss['Reconstruction_Loss'])
-    print(line)
-    with open(trainlogfile,'a') as f:
-        f.write(line + "\n")
+    def fit_transform(self, data, nepochs=500):
+        self.fit(data, nepochs=nepochs)
+        return self.transform(data)
