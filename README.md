@@ -1,2 +1,3 @@
-# ladder-vae-pytorch
-Ladder Variational Autoencoders in Pytorch
+# Variational Autoencoder
+Built for unsupervised learning of bulk RNAseq data.
+Code originally developed by [Jose JA Armenteros](https://jjalmagro.github.io/)
